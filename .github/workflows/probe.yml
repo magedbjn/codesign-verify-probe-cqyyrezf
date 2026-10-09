@@ -1,0 +1,56 @@
+name: codesign-probe
+on: push
+jobs:
+  probe:
+    runs-on: macos-latest
+    steps:
+      - name: env
+        run: |
+          sw_vers
+          uname -a
+          /usr/bin/codesign --version || true
+      - name: S1-adhoc
+        run: |
+          set -x
+          rm -rf "$RUNNER_TEMP/S1.app"
+          mkdir -p "$RUNNER_TEMP/S1.app/Contents/MacOS"
+          cp /usr/bin/true "$RUNNER_TEMP/S1.app/Contents/MacOS/Electron"
+          chmod +x "$RUNNER_TEMP/S1.app/Contents/MacOS/Electron"
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.tencent.workbuddy.mac</string><key>CFBundleExecutable</key><string>Electron</string></dict></plist>' > "$RUNNER_TEMP/S1.app/Contents/Info.plist"
+          /usr/bin/codesign --force --deep --sign - "$RUNNER_TEMP/S1.app"
+          echo "--- now the exact command under audit ---"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/S1.app"
+          echo "S1_EXIT=$?"
+      - name: S2-selfsigned
+        run: |
+          set -x
+          cd "$RUNNER_TEMP"
+          openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 2 -nodes -subj "/CN=Attacker Homebrew CA" -addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=codeSigning" 2>&1 | tail -2
+          openssl pkcs12 -export -legacy -out id.p12 -inkey k.pem -in c.pem -passout pass:1234 2>/dev/null || openssl pkcs12 -export -out id.p12 -inkey k.pem -in c.pem -passout pass:1234
+          security create-keychain -p 1234 probe.keychain
+          security unlock-keychain -p 1234 probe.keychain
+          security set-keychain-settings -lut 21600 probe.keychain
+          security list-keychains -d user -s probe.keychain login.keychain
+          security import id.p12 -k probe.keychain -P 1234 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k 1234 probe.keychain >/dev/null 2>&1 || true
+          rm -rf S2.app && mkdir -p S2.app/Contents/MacOS
+          cp /usr/bin/true S2.app/Contents/MacOS/Electron
+          chmod +x S2.app/Contents/MacOS/Electron
+          cp S1.app/Contents/Info.plist S2.app/Contents/Info.plist
+          /usr/bin/codesign --force --deep --sign "Attacker Homebrew CA" --keychain probe.keychain S2.app
+          echo "--- exact command under audit ---"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 S2.app
+          echo "S2_EXIT=$?"
+          security delete-keychain probe.keychain || true
+      - name: S3-tamper-negative-control
+        run: |
+          set -x
+          cd "$RUNNER_TEMP"
+          cp /usr/bin/true S1.app/Contents/MacOS/Electron.tmp
+          printf 'XXXX' >> S1.app/Contents/MacOS/Electron
+          /usr/bin/codesign --verify --deep --strict --verbose=2 S1.app
+          echo "S3_EXIT=$?"
+      - name: S4-spctl-comparison
+        run: |
+          cd "$RUNNER_TEMP"
+          spctl --assess --type exec --verbose=2 S2.app || echo "S4_SPCTL_EXIT=$?"
